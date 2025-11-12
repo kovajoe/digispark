@@ -1,243 +1,193 @@
 <#
-.SYNOPSIS
-  Discover online hosts in the local network, with basic device info.
-
-.DESCRIPTION
-  - Auto-detects local IPv4 + prefix or accepts a CIDR via -Cidr.
-  - Pings hosts in parallel (chunked) to find alive hosts.
-  - Gathers DNS name, ARP/MAC, basic port checks (common ports), and NetBIOS name.
-  - Outputs results to console and saves CSV to $env:TEMP\network_scan_<timestamp>.csv
-
-.PARAMETER Cidr
-  Optional. Provide a network in CIDR format (e.g. 192.168.1.0/24). If not supplied, script auto-detects.
-.EXAMPLE
-  .\scan-network.ps1
-  .\scan-network.ps1 -Cidr "10.10.0.0/24"
+scan-network-fixed.ps1
+- Auto-detects IPv4 + prefix or accepts -Cidr "192.168.1.0/24"
+- Performs chunked ping sweep then collects DNS, ARP/MAC, quick TCP port checks
+- Saves results to CSV in $env:TEMP
+Note: Run only on networks you are authorized to scan.
 #>
 
 param(
   [string]$Cidr
 )
 
-function Get-LocalIPv4Network {
-  # Try Get-NetIPAddress (modern), fallback to ipconfig parsing
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+function Write-Log { param($s) Write-Host $s }
+
+# --- Helpers ---
+function Get-LocalNetwork {
   try {
-    $ip = Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias ((Get-NetIPInterface | Where-Object {$_.ConnectionState -eq "Connected"} | Select-Object -First 1).InterfaceAlias) -ErrorAction Stop |
-          Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.PrefixLength -gt 0 } | Select-Object -First 1
-    if ($ip) {
-      return @{ IP = $ip.IPAddress; Prefix = $ip.PrefixLength }
+    # Prefer Get-NetIPAddress when available (Windows 8+/Server 2012+)
+    if (Get-Command Get-NetIPAddress -ErrorAction SilentlyContinue) {
+      $iface = Get-NetIPInterface -AddressFamily IPv4 |
+               Where-Object { $_.ConnectionState -eq 'Connected' -and $_.InterfaceOperationalStatus -eq 'Up' } |
+               Sort-Object -Property InterfaceMetric |
+               Select-Object -First 1
+      if ($iface) {
+        $ipObj = Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $iface.InterfaceIndex |
+                 Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.PrefixLength -gt 0 } | Select-Object -First 1
+        if ($ipObj) {
+          return @{ IP = $ipObj.IPAddress; Prefix = [int]$ipObj.PrefixLength }
+        }
+      }
     }
   } catch { }
 
   # Fallback: parse ipconfig
-  $cfg = ipconfig
-  foreach ($line in $cfg) {
-    if ($line -match 'IPv4 Address.*:\s*([\d\.]+)') {
-      $ipAddr = $matches[1]
-    }
-    if ($line -match 'Subnet Mask.*:\s*([\d\.]+)') {
-      $sub = $matches[1]
-      if ($ipAddr) {
+  try {
+    $txt = ipconfig /all 2>&1
+    $ip = $null; $mask = $null
+    foreach ($line in $txt) {
+      if ($line -match 'IPv4 Address.*:\s*([\d\.]+)') { $ip = $matches[1] }
+      if ($line -match 'Subnet Mask.*:\s*([\d\.]+)') { $mask = $matches[1] }
+      if ($ip -and $mask) {
         # convert mask to prefix
-        $bytes = $sub.Split('.') | ForEach-Object {[int]$_}
-        $bin = ($bytes | ForEach-Object { [Convert]::ToString($_,2).PadLeft(8,'0') }) -join ''
-        $prefix = ($bin -split '1').Length - 1
-        return @{ IP = $ipAddr; Prefix = $prefix }
+        $parts = $mask.Split('.') | ForEach-Object {[int]$_}
+        $bin = ($parts | ForEach-Object { [Convert]::ToString($_,2).PadLeft(8,'0') }) -join ''
+        $prefix = ($bin.ToCharArray() | Where-Object { $_ -eq '1' }).Count
+        return @{ IP = $ip; Prefix = $prefix }
       }
     }
-  }
-  throw "Unable to auto-detect local IPv4 address. Provide -Cidr manually."
+  } catch { }
+
+  throw "Failed to auto-detect local IPv4 address. Provide -Cidr."
 }
 
-function Get-IPRangeFromCidr {
-  param($cidr)
-  # cidr must be like x.x.x.x/nn
-  $parts = $cidr -split '/'
-  if ($parts.Count -ne 2) { throw "Invalid CIDR: $cidr" }
-  $ip = [System.Net.IPAddress]::Parse($parts[0])
-  $pref = [int]$parts[1]
-  # compute network and broadcast
-  $ipBytes = [BitConverter]::ToUInt32([System.Net.IPAddress]::HostToNetworkOrder([int][BitConverter]::ToInt32($ip.GetAddressBytes(),0)),0)
-  $mask = -bor (-shl 0xffffffff, (32 - $pref))   # not portable very terse - use bigint approach
-  # safer compute mask:
-  $maskInt = [uint32]((([math]::Pow(2,32) - 1) - ([math]::Pow(2, (32-$pref)) - 1)))
-  $netInt = $ipBytes -band $maskInt
-  $first = $netInt + 1
-  $last = ($netInt + ([uint32]([math]::Pow(2, (32 - $pref)) - 1))) - 1
-  $hosts = @()
-  for ($i = $first; $i -le $last; $i++) {
-    # convert back to dotted
-    $b = [BitConverter]::GetBytes([uint32]$i)
-    $b = [Array]::Reverse($b); # ensure network order -> host order
-    $ipAddr = [System.Net.IPAddress]::Parse(($b[0]).ToString() + "." + ($b[1]).ToString() + "." + ($b[2]).ToString() + "." + ($b[3]).ToString())
-    $hosts += $ipAddr.IPAddressToString
-  }
-  return $hosts
+function IpToUint32([string]$ip) {
+  $b = $ip.Split('.') | ForEach-Object {[uint32]$_}
+  return ($b[0] -shl 24) -bor ($b[1] -shl 16) -bor ($b[2] -shl 8) -bor $b[3]
+}
+function Uint32ToIp([uint32]$n) {
+  $b1 = ($n -shr 24) -band 0xFF
+  $b2 = ($n -shr 16) -band 0xFF
+  $b3 = ($n -shr 8) -band 0xFF
+  $b4 = $n -band 0xFF
+  return "$b1.$b2.$b3.$b4"
 }
 
-function Get-HostsFromCIDRAlt {
-  param($ip, $prefix)
-  # Using IPNetwork class from .NET not available by default; do manual compute simpler:
-  # Convert IP to UInt32:
-  $bytes = $ip.Split('.') | ForEach-Object {[byte]$_}
-  $ipInt = ([uint32]$bytes[0] -shl 24) -bor ([uint32]$bytes[1] -shl 16) -bor ([uint32]$bytes[2] -shl 8) -bor ([uint32]$bytes[3])
-  $hostBits = 32 - [int]$prefix
+function Get-HostEnumerableFromCIDR([string]$baseIp, [int]$prefix) {
+  $ipInt = [uint32](IpToUint32 $baseIp)
+  $hostBits = 32 - $prefix
   if ($hostBits -le 0) { return @() }
-  $numHosts = [uint32]([math]::Pow(2, $hostBits) - 2)  # exclude network and broadcast
-  $netInt = $ipInt -band ([uint32](-bor ((-bor 0,0))))
-  # easier: compute net by zeroing host bits
-  $maskUint = ([uint32](((-band ([uint32]0xffffffff), ([uint32]0xffffffff << $hostBits)))))
-  # simpler compute mask via shift:
-  $maskUint = ([uint32](([uint64]0xffffffff) - ([math]::Pow(2,$hostBits) - 1)))
-  $net = $ipInt -band $maskUint
+  $mask = ([uint32]0xFFFFFFFF) -shl $hostBits
+  $net = $ipInt -band $mask
   $first = $net + 1
-  $last = $net + [uint32]([math]::Pow(2,$hostBits) - 2)
-  $list = for ($i = $first; $i -le $last; $i++) {
-    $b1 = (($i -shr 24) -band 0xFF)
-    $b2 = (($i -shr 16) -band 0xFF)
-    $b3 = (($i -shr 8) -band 0xFF)
-    $b4 = ($i -band 0xFF)
-    "$b1.$b2.$b3.$b4"
+  $last = $net + ([uint32]([math]::Pow(2,$hostBits) - 2))
+  # return array of strings
+  $list = New-Object System.Collections.Generic.List[System.String]
+  for ($i = $first; $i -le $last; $i++) {
+    $list.Add((Uint32ToIp [uint32]$i))
   }
   return $list
 }
 
-function Get-MACFromArp {
+function Get-ARP {
   param($ip)
-  $arp = arp -a $ip 2>$null
-  if ($arp -and $arp -match "([0-9a-fA-F]{2}[-:]){5}[0-9a-fA-F]{2}") {
-    return ($matches[0] -replace '-',':')
-  }
-  # fallback: parse arp -a table
-  $table = arp -a | Where-Object {$_ -match $ip}
-  if ($table -match "([0-9a-fA-F]{2}[-:]){5}[0-9a-fA-F]{2}") { return ($matches[0] -replace '-',':') }
+  try {
+    $out = arp -a 2>$null
+    foreach ($line in $out) {
+      if ($line -match "^\s*([0-9]{1,3}(\.[0-9]{1,3}){3})\s+([0-9A-Fa-f:-]{17,17})") {
+        if ($matches[1] -eq $ip) { return ($matches[3] -replace '-',' :') -replace ' ','': ($matches[3]) }
+      }
+    }
+  } catch {}
   return $null
+}
+
+function Test-Port {
+  param($ip,$port,[int]$timeout=250)
+  try {
+    $tc = New-Object System.Net.Sockets.TcpClient
+    $iar = $tc.BeginConnect($ip,$port,$null,$null)
+    $wait = $iar.AsyncWaitHandle.WaitOne($timeout)
+    if (-not $wait) { $tc.Close(); return $false }
+    $tc.EndConnect($iar)
+    $tc.Close()
+    return $true
+  } catch { return $false }
 }
 
 function Get-DeviceInfo {
   param($ip)
-  $info = [PSCustomObject]@{
+  $obj = [PSCustomObject]@{
     IP = $ip
     Alive = $false
     HostName = ''
     MAC = ''
     OpenPorts = @()
-    NetBIOS = ''
   }
-
-  if ((Test-Connection -ComputerName $ip -Count 1 -Quiet -ErrorAction SilentlyContinue)) {
-    $info.Alive = $true
-    # DNS reverse lookup
-    try { $info.HostName = [System.Net.Dns]::GetHostEntry($ip).HostName } catch { $info.HostName = '' }
-
-    # ARP / MAC
-    Start-Sleep -Milliseconds 20
-    $mac = Get-MACFromArp -ip $ip
+  if (Test-Connection -ComputerName $ip -Count 1 -Quiet -ErrorAction SilentlyContinue) {
+    $obj.Alive = $true
+    try { $obj.HostName = [System.Net.Dns]::GetHostEntry($ip).HostName } catch {}
+    Start-Sleep -Milliseconds 30
+    $mac = Get-ARP -ip $ip
     if (-not $mac) {
-      # populate ARP by pinging then re-check
-      Test-Connection -ComputerName $ip -Count 1 | Out-Null
-      $mac = Get-MACFromArp -ip $ip
+      Test-Connection -ComputerName $ip -Count 1 -Quiet | Out-Null
+      $mac = Get-ARP -ip $ip
     }
-    $info.MAC = $mac
-
-    # Common ports quick check
-    $ports = 80,443,22,23,3389,445,139,161
-    foreach ($port in $ports) {
-      try {
-        $res = Test-NetConnection -ComputerName $ip -Port $port -WarningAction SilentlyContinue
-        if ($res -and $res.TcpTestSucceeded) { $info.OpenPorts += $port }
-      } catch { }
+    if ($mac) { $obj.MAC = $mac }
+    $ports = 80,443,22,3389,445,139,161,8080
+    foreach ($p in $ports) {
+      if (Test-Port -ip $ip -port $p -timeout 300) { $obj.OpenPorts += $p }
     }
-
-    # Try NetBIOS name
-    try {
-      $nb = nbstat -A $ip 2>$null
-      if ($nb -match 'Name') {
-        # parse name line if exists
-        $lines = $nb -split "`r?`n"
-        foreach ($l in $lines) {
-          if ($l -match '^\s*<00>\s+UNIQUE\s+(.+)$') {
-            $info.NetBIOS = ($l -replace '^\s*','') ; break
-          }
-        }
-      }
-    } catch {}
   }
-
-  return $info
+  return $obj
 }
 
 # ---------------- main ----------------
-
-Write-Host "Network scanner - quick discover" -ForegroundColor Cyan
-
-if (-not $Cidr) {
-  try {
-    $net = Get-LocalIPv4Network
-    $ip = $net.IP
-    $pref = $net.Prefix
-    Write-Host "Detected IP: $ip / $pref"
-  } catch {
-    Write-Host "Auto-detect failed: $_" -ForegroundColor Red
-    exit 1
+try {
+  if (-not $Cidr) {
+    $net = Get-LocalNetwork
+    $ip = $net.IP; $prefix = [int]$net.Prefix
+    Write-Log "Detected: $ip/$prefix"
+  } else {
+    $parts = $Cidr -split '/'
+    if ($parts.Count -ne 2) { throw "Bad CIDR" }
+    $ip = $parts[0]; $prefix = [int]$parts[1]
+    Write-Log "Using CIDR: $ip/$prefix"
   }
-} else {
-  $parts = $Cidr -split '/'
-  if ($parts.Count -ne 2) { Write-Host "Invalid CIDR format. Use x.x.x.x/nn" ; exit 1 }
-  $ip = $parts[0]; $pref = [int]$parts[1]
-  Write-Host "Using provided CIDR: $ip / $pref"
-}
 
-# Build host list: avoid huge networks
-$hostCount = [math]::Pow(2, (32 - $pref)) - 2
-if ($hostCount -gt 4096) {
-  Write-Host "Network too large ($hostCount hosts). Limit is 4096. Provide a narrower CIDR or run from dedicated scanner." -ForegroundColor Yellow
+  $hostCount = [math]::Pow(2,(32 - $prefix)) - 2
+  if ($hostCount -gt 65536) { throw "Network too big ($hostCount hosts). Use smaller CIDR." }
+
+  $hosts = Get-HostEnumerableFromCIDR -baseIp $ip -prefix $prefix
+  Write-Log "Scanning $($hosts.Count) hosts..."
+
+  $chunk = 120
+  $results = @()
+
+  for ($i=0; $i -lt $hosts.Count; $i += $chunk) {
+    $slice = $hosts[$i..([math]::Min($i+$chunk-1,$hosts.Count-1))]
+    # fast parallel ping using Test-Connection with array input
+    $aliveFlags = $null
+    try {
+      $aliveFlags = Test-Connection -ComputerName $slice -Count 1 -ErrorAction SilentlyContinue -Quiet
+    } catch {
+      # fallback single
+      $aliveFlags = foreach ($h in $slice) { Test-Connection -ComputerName $h -Count 1 -Quiet }
+    }
+
+    for ($j=0; $j -lt $slice.Count; $j++) {
+      $h = $slice[$j]
+      $alive = $false
+      if ($aliveFlags -is [System.Collections.IEnumerable]) { $alive = [bool]$aliveFlags[$j] } else { $alive = [bool]$aliveFlags }
+      if ($alive) {
+        $info = Get-DeviceInfo -ip $h
+        $results += $info
+        $ports = if ($info.OpenPorts.Count) { $info.OpenPorts -join ',' } else { '-' }
+        Write-Host ("{0}  {1,-40}  MAC:{2,-17} Ports:{3}" -f $h, ($info.HostName -ne '' ? $info.HostName : '-'), ($info.MAC -ne '' ? $info.MAC : '-'), $ports)
+      }
+    }
+  }
+
+  $ts = (Get-Date).ToString('yyyyMMdd_HHmmss')
+  $out = Join-Path $env:TEMP "network_scan_$ts.csv"
+  $results | Select-Object IP,HostName,MAC,@{Name='OpenPorts';Expression={$_.OpenPorts -join ','}} |
+    Export-Csv -Path $out -NoTypeInformation -Encoding UTF8
+
+  Write-Log "`nScan complete. Found $($results.Count) hosts. CSV: $out"
+} catch {
+  Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
   exit 1
 }
-
-# Generate hosts
-$hosts = Get-HostsFromCIDRAlt -ip $ip -prefix $pref
-
-Write-Host ("Scanning {0} hosts (concurrency chunked)" -f $hosts.Count) -ForegroundColor Green
-
-# Parameters
-$chunk = 80   # number of hosts to probe per Test-Connection call (tweak as needed)
-$results = @()
-
-for ($i = 0; $i -lt $hosts.Count; $i += $chunk) {
-  $slice = $hosts[$i..([math]::Min($i+$chunk-1,$hosts.Count-1))]
-  # Test-Connection accepts arrays and returns faster than individual pings in many cases
-  $aliveFlags = $null
-  try {
-    $aliveFlags = Test-Connection -ComputerName $slice -Count 1 -ErrorAction SilentlyContinue -Quiet
-  } catch {
-    # fallback: sequential
-    $aliveFlags = foreach ($h in $slice) { Test-Connection -ComputerName $h -Count 1 -Quiet -ErrorAction SilentlyContinue }
-  }
-
-  for ($j = 0; $j -lt $slice.Count; $j++) {
-    $h = $slice[$j]
-    $alive = $false
-    if ($aliveFlags -is [System.Collections.IEnumerable]) {
-      $alive = [bool]$aliveFlags[$j]
-    } else {
-      $alive = [bool]$aliveFlags
-    }
-
-    if ($alive) {
-      # gather more info (not too slow)
-      $info = Get-DeviceInfo -ip $h
-      $results += $info
-      $fmtPorts = if ($info.OpenPorts) { ($info.OpenPorts -join ',') } else { '-' }
-      Write-Host ("{0}  {1}  {2}  MAC:{3}  Ports:{4}" -f $h, ($info.HostName -ne '' ? $info.HostName : '-'), ($info.NetBIOS -ne '' ? $info.NetBIOS : '-'), ($info.MAC -ne '' ? $info.MAC : '-'), $fmtPorts)
-    }
-  }
-}
-
-# Save CSV
-$ts = (Get-Date).ToString("yyyyMMdd_HHmmss")
-$outFile = Join-Path $env:TEMP "network_scan_$ts.csv"
-$results | Select-Object IP,HostName,NetBIOS,MAC,@{n='OpenPorts';e={($_.OpenPorts -join ',')}} | Export-Csv -Path $outFile -NoTypeInformation -Encoding UTF8
-
-Write-Host "`nScan complete. Found $($results.Count) hosts alive."
-Write-Host "Results saved to: $outFile"
